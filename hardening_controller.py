@@ -42,16 +42,25 @@ class HardeningController:
     def check_scripts(self):
         """Check if all required scripts are present"""
         missing = []
+        present = []
+        
         for tid, info in self.topics.items():
             script_path = self.scripts_dir / info["script"]
             if not script_path.exists():
                 missing.append(info["script"])
+            else:
+                present.append(info["script"])
         
         if missing:
             print(f"\n[WARNING] Missing {len(missing)} script(s) in {self.scripts_dir}:")
             for script in missing:
-                print(f"  - {script}")
-            print("\nPlease run install.sh again or manually copy scripts to hardening_scripts/\n")
+                print(f"  ✗ {script}")
+            print(f"\nPresent: {len(present)} script(s)")
+            for script in present:
+                print(f"  ✓ {script}")
+            print("\nPlease run 'sudo python3 install.py' again or manually copy scripts to hardening_scripts/\n")
+        else:
+            print(f"\n[INFO] All {len(present)} hardening scripts are present ✓\n")
     
     def init_database(self):
         """Initialize SQLite database for storing configurations"""
