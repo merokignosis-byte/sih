@@ -22,6 +22,9 @@ PASSED_CHECKS=0
 FAILED_CHECKS=0
 FIXED_CHECKS=0
 
+# Track if fstab was modified (to run mount -a once at the end)
+FSTAB_MODIFIED=false
+
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -70,6 +73,42 @@ result = cursor.fetchone()
 conn.close()
 print(result[0] if result else '')
 "
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Check if a directory is on the root filesystem
+is_on_root_filesystem() {
+    local dir="$1"
+    local dir_device=$(df "$dir" 2>/dev/null | tail -1 | awk '{print $1}')
+    local root_device=$(df / | tail -1 | awk '{print $1}')
+    
+    if [ "$dir_device" = "$root_device" ]; then
+        return 0  # True - on root filesystem
+    else
+        return 1  # False - separate partition
+    fi
+}
+
+# Check if directory exists in fstab
+fstab_has_entry() {
+    local partition="$1"
+    grep -q "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab
+}
+
+# Get current mount options for a partition
+get_mount_options() {
+    local partition="$1"
+    mount | grep " on $partition " | sed 's/.*(\(.*\))/\1/'
+}
+
+# Check if mount has specific option
+has_mount_option() {
+    local partition="$1"
+    local option="$2"
+    mount | grep " on $partition " | grep -q "$option"
 }
 
 # ============================================================================
@@ -176,7 +215,7 @@ check_partition() {
     echo "Rule ID: $rule_id"
     
     if [ "$MODE" = "scan" ]; then
-        # Check if partition exists
+        # Check if partition/directory is mounted
         if ! mount | grep -q " on $partition "; then
             log_warn "Partition $partition does not exist or is not mounted"
             ((FAILED_CHECKS++))
@@ -184,7 +223,7 @@ check_partition() {
         fi
         
         # Check for specific option in mount output
-        if mount | grep " on $partition " | grep -q "$option"; then
+        if has_mount_option "$partition" "$option"; then
             log_pass "Partition $partition has $option option"
             ((PASSED_CHECKS++))
             return 0
@@ -196,46 +235,80 @@ check_partition() {
         
     elif [ "$MODE" = "fix" ]; then
         # Check if partition exists first
-        if ! mount | grep -q " on $partition "; then
-            log_warn "Partition $partition does not exist - cannot apply $option option"
+        if [ ! -d "$partition" ]; then
+            log_warn "Directory $partition does not exist - cannot apply $option option"
             return 1
         fi
         
         # Save current state
-        local current_opts=$(mount | grep " on $partition " | sed 's/.*(\(.*\))/\1/')
+        local current_opts=$(get_mount_options "$partition")
         save_config "$rule_id" "$rule_name" "$current_opts"
         
-        # Backup fstab
-        cp /etc/fstab "$BACKUP_DIR/fstab.$(date +%Y%m%d_%H%M%S)"
+        # Backup fstab before any modification
+        if [ "$FSTAB_MODIFIED" = "false" ]; then
+            cp /etc/fstab "$BACKUP_DIR/fstab.$(date +%Y%m%d_%H%M%S)"
+            log_info "Created fstab backup"
+        fi
         
-        # Check if partition entry exists in fstab
-        if grep -q " $partition " /etc/fstab; then
-            # Check if option already present in fstab
-            if grep " $partition " /etc/fstab | grep -q "$option"; then
+        # Determine if this is a tmpfs mount (special handling)
+        local is_tmpfs=false
+        if [ "$partition" = "/tmp" ] || [ "$partition" = "/dev/shm" ]; then
+            is_tmpfs=true
+        fi
+        
+        # Check if partition already has an entry in fstab
+        if fstab_has_entry "$partition"; then
+            # Entry exists - modify it to add missing option
+            if grep "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab | grep -q "$option"; then
                 log_info "$partition already has $option in fstab"
             else
-                # Add option - handle different fstab formats
-                if grep " $partition " /etc/fstab | grep -q "defaults"; then
-                    # Add to defaults
-                    sed -i "/ $partition /s/defaults/defaults,$option/" /etc/fstab
-                else
-                    # Get current options and append
-                    local fstab_opts=$(grep " $partition " /etc/fstab | awk '{print $4}')
-                    sed -i "/ $partition /s/$fstab_opts/$fstab_opts,$option/" /etc/fstab
-                fi
-                log_info "Added $option to $partition in /etc/fstab"
-            fi
-            
-            # Remount partition with new options
-            if mount -o remount,"$option" "$partition" 2>/dev/null; then
-                log_info "Successfully remounted $partition with $option option"
-                ((FIXED_CHECKS++))
-            else
-                log_warn "Failed to remount $partition - may require reboot"
+                # Add the option to existing entry
+                sed -i "/^[^#]*[[:space:]]$partition[[:space:]]/s/\([[:space:]][^[:space:]]*[[:space:]][^[:space:]]*[[:space:]]\)\([^[:space:]]*\)/\1\2,$option/" /etc/fstab
+                log_info "Added $option to existing $partition entry in fstab"
+                FSTAB_MODIFIED=true
                 ((FIXED_CHECKS++))
             fi
         else
-            log_warn "Partition $partition not found in /etc/fstab - manual configuration required"
+            # No entry exists - need to add one
+            if is_on_root_filesystem "$partition" && [ "$is_tmpfs" = "false" ]; then
+                # Directory is on root filesystem - create bind mount
+                log_info "$partition is on root filesystem - creating bind mount entry"
+                
+                # Determine appropriate options
+                local mount_opts="defaults,bind,$option"
+                
+                # Add bind mount entry to fstab
+                echo "" >> /etc/fstab
+                echo "# Bind mount for $partition with security options" >> /etc/fstab
+                echo "$partition    $partition    none    $mount_opts    0 0" >> /etc/fstab
+                
+                log_info "Added bind mount entry for $partition with $option option"
+                FSTAB_MODIFIED=true
+                ((FIXED_CHECKS++))
+                
+            elif [ "$is_tmpfs" = "true" ]; then
+                # This is a tmpfs mount - add tmpfs entry
+                log_info "$partition should be tmpfs - creating tmpfs entry"
+                
+                local mount_opts="defaults,$option"
+                local size_opt=""
+                
+                if [ "$partition" = "/tmp" ]; then
+                    size_opt=",size=2G"  # Adjust size as needed
+                elif [ "$partition" = "/dev/shm" ]; then
+                    size_opt=",size=1G"  # Adjust size as needed
+                fi
+                
+                echo "" >> /etc/fstab
+                echo "# Tmpfs mount for $partition with security options" >> /etc/fstab
+                echo "tmpfs    $partition    tmpfs    ${mount_opts}${size_opt}    0 0" >> /etc/fstab
+                
+                log_info "Added tmpfs entry for $partition with $option option"
+                FSTAB_MODIFIED=true
+                ((FIXED_CHECKS++))
+            else
+                log_warn "$partition is a separate partition but not in fstab - manual configuration required"
+            fi
         fi
         
     elif [ "$MODE" = "rollback" ]; then
@@ -245,18 +318,112 @@ check_partition() {
             local latest_backup=$(ls -t "$BACKUP_DIR"/fstab.* 2>/dev/null | head -1)
             if [ -n "$latest_backup" ]; then
                 cp "$latest_backup" /etc/fstab
-                mount -o remount "$partition" 2>/dev/null
                 log_info "Restored original fstab for $partition"
             fi
         fi
     fi
 }
 
+# Enhanced partition check that handles multiple options at once
+check_partition_with_options() {
+    local partition="$1"
+    shift  # Remove first argument, rest are options
+    local options=("$@")
+    
+    local rule_id="FS-PART-$(echo $partition | tr '/' '-' | tr '[:lower:]' '[:upper:]')-MULTI"
+    local rule_name="Ensure security options set on $partition partition"
+    
+    if [ "$MODE" = "fix" ]; then
+        # Check if partition exists first
+        if [ ! -d "$partition" ]; then
+            log_warn "Directory $partition does not exist - skipping"
+            return 1
+        fi
+        
+        # Determine if this is a tmpfs mount
+        local is_tmpfs=false
+        if [ "$partition" = "/tmp" ] || [ "$partition" = "/dev/shm" ]; then
+            is_tmpfs=true
+        fi
+        
+        # Build options string
+        local opts_string=""
+        for opt in "${options[@]}"; do
+            if [ -z "$opts_string" ]; then
+                opts_string="$opt"
+            else
+                opts_string="$opts_string,$opt"
+            fi
+        done
+        
+        # Check if partition already has an entry in fstab
+        if fstab_has_entry "$partition"; then
+            # Entry exists - ensure all options are present
+            local modified=false
+            for opt in "${options[@]}"; do
+                if ! grep "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab | grep -q "$opt"; then
+                    sed -i "/^[^#]*[[:space:]]$partition[[:space:]]/s/\([[:space:]][^[:space:]]*[[:space:]][^[:space:]]*[[:space:]]\)\([^[:space:]]*\)/\1\2,$opt/" /etc/fstab
+                    log_info "Added $opt to existing $partition entry in fstab"
+                    modified=true
+                fi
+            done
+            
+            if [ "$modified" = "true" ]; then
+                FSTAB_MODIFIED=true
+                ((FIXED_CHECKS++))
+            fi
+        else
+            # No entry exists - need to add one
+            if [ "$FSTAB_MODIFIED" = "false" ]; then
+                cp /etc/fstab "$BACKUP_DIR/fstab.$(date +%Y%m%d_%H%M%S)"
+                log_info "Created fstab backup"
+            fi
+            
+            if is_on_root_filesystem "$partition" && [ "$is_tmpfs" = "false" ]; then
+                # Directory is on root filesystem - create bind mount
+                log_info "$partition is on root filesystem - creating bind mount entry"
+                
+                echo "" >> /etc/fstab
+                echo "# Bind mount for $partition with security options" >> /etc/fstab
+                echo "$partition    $partition    none    defaults,bind,$opts_string    0 0" >> /etc/fstab
+                
+                log_info "Added bind mount entry for $partition with options: $opts_string"
+                FSTAB_MODIFIED=true
+                ((FIXED_CHECKS++))
+                
+            elif [ "$is_tmpfs" = "true" ]; then
+                # This is a tmpfs mount
+                log_info "$partition should be tmpfs - creating tmpfs entry"
+                
+                local size_opt=""
+                if [ "$partition" = "/tmp" ]; then
+                    size_opt=",size=2G"
+                elif [ "$partition" = "/dev/shm" ]; then
+                    size_opt=",size=1G"
+                fi
+                
+                echo "" >> /etc/fstab
+                echo "# Tmpfs mount for $partition with security options" >> /etc/fstab
+                echo "tmpfs    $partition    tmpfs    defaults,$opts_string$size_opt    0 0" >> /etc/fstab
+                
+                log_info "Added tmpfs entry for $partition with options: $opts_string"
+                FSTAB_MODIFIED=true
+                ((FIXED_CHECKS++))
+            fi
+        fi
+    fi
+    
+    # Always run individual checks for scan mode
+    for opt in "${options[@]}"; do
+        check_partition "$partition" "$opt"
+    done
+}
+
 check_tmp_partition() {
     log_info "=== Checking /tmp Partition ==="
     
     local rule_id="FS-TMP-SEPARATE"
-    local rule_name="Ensure /tmp is a separate partition"
+    local rule_name="Ensure /tmp is configured"
     
     ((TOTAL_CHECKS++))
     echo ""
@@ -265,21 +432,22 @@ check_tmp_partition() {
     
     if [ "$MODE" = "scan" ]; then
         if mount | grep -q " on /tmp "; then
-            log_pass "/tmp is a separate partition"
+            log_pass "/tmp is mounted"
             ((PASSED_CHECKS++))
         else
-            log_error "/tmp is not a separate partition"
+            log_error "/tmp is not mounted"
             ((FAILED_CHECKS++))
         fi
     elif [ "$MODE" = "fix" ]; then
         if ! mount | grep -q " on /tmp "; then
-            log_warn "/tmp partition creation requires manual intervention"
-            log_info "Consider using systemd tmp.mount or creating a dedicated partition"
+            log_info "/tmp will be configured as tmpfs with security options"
         fi
     fi
     
-    # Check options if partition exists
-    if mount | grep -q " on /tmp "; then
+    # Check/fix options
+    if [ "$MODE" = "fix" ]; then
+        check_partition_with_options "/tmp" "nodev" "nosuid" "noexec"
+    else
         check_partition "/tmp" "nodev"
         check_partition "/tmp" "nosuid"
         check_partition "/tmp" "noexec"
@@ -290,7 +458,7 @@ check_dev_shm_partition() {
     log_info "=== Checking /dev/shm Partition ==="
     
     local rule_id="FS-DEVSHM-SEPARATE"
-    local rule_name="Ensure /dev/shm exists"
+    local rule_name="Ensure /dev/shm is configured"
     
     ((TOTAL_CHECKS++))
     echo ""
@@ -307,12 +475,14 @@ check_dev_shm_partition() {
         fi
     elif [ "$MODE" = "fix" ]; then
         if ! mount | grep -q " on /dev/shm "; then
-            log_warn "/dev/shm is not mounted - this is unusual"
+            log_info "/dev/shm will be configured as tmpfs with security options"
         fi
     fi
     
-    # Check options if partition exists
-    if mount | grep -q " on /dev/shm "; then
+    # Check/fix options
+    if [ "$MODE" = "fix" ]; then
+        check_partition_with_options "/dev/shm" "nodev" "nosuid" "noexec"
+    else
         check_partition "/dev/shm" "nodev"
         check_partition "/dev/shm" "nosuid"
         check_partition "/dev/shm" "noexec"
@@ -323,7 +493,7 @@ check_home_partition() {
     log_info "=== Checking /home Partition ==="
     
     local rule_id="FS-HOME-SEPARATE"
-    local rule_name="Ensure separate partition exists for /home"
+    local rule_name="Ensure /home is configured"
     
     ((TOTAL_CHECKS++))
     echo ""
@@ -332,22 +502,32 @@ check_home_partition() {
     
     if [ "$MODE" = "scan" ]; then
         if mount | grep -q " on /home "; then
-            log_pass "/home is a separate partition"
+            if is_on_root_filesystem "/home"; then
+                log_warn "/home is on root filesystem (bind mount recommended)"
+            else
+                log_pass "/home is a separate partition"
+            fi
             ((PASSED_CHECKS++))
         else
-            log_warn "/home is not a separate partition (recommended)"
+            log_warn "/home is not separately mounted (recommended)"
             ((FAILED_CHECKS++))
         fi
     elif [ "$MODE" = "fix" ]; then
         if ! mount | grep -q " on /home "; then
-            log_warn "/home partition creation requires manual intervention"
+            if is_on_root_filesystem "/home"; then
+                log_info "/home is on root filesystem - will create bind mount"
+            fi
         fi
     fi
     
-    # Check options if partition exists
-    if mount | grep -q " on /home "; then
-        check_partition "/home" "nodev"
-        check_partition "/home" "nosuid"
+    # Check/fix options
+    if [ "$MODE" = "fix" ]; then
+        check_partition_with_options "/home" "nodev" "nosuid"
+    else
+        if mount | grep -q " on /home " || [ -d "/home" ]; then
+            check_partition "/home" "nodev"
+            check_partition "/home" "nosuid"
+        fi
     fi
 }
 
@@ -357,7 +537,7 @@ check_var_partitions() {
     for part in "/var" "/var/tmp" "/var/log" "/var/log/audit"; do
         local part_clean=$(echo $part | tr '/' '-')
         local rule_id="FS-VAR${part_clean}-SEPARATE"
-        local rule_name="Ensure separate partition exists for $part"
+        local rule_name="Ensure $part is configured"
         
         ((TOTAL_CHECKS++))
         echo ""
@@ -366,24 +546,38 @@ check_var_partitions() {
         
         if [ "$MODE" = "scan" ]; then
             if mount | grep -q " on $part "; then
-                log_pass "$part is a separate partition"
+                if is_on_root_filesystem "$part"; then
+                    log_warn "$part is on root filesystem (bind mount recommended)"
+                else
+                    log_pass "$part is a separate partition"
+                fi
                 ((PASSED_CHECKS++))
             else
-                log_warn "$part is not a separate partition (recommended)"
+                log_warn "$part is not separately mounted (recommended)"
                 ((FAILED_CHECKS++))
             fi
         elif [ "$MODE" = "fix" ]; then
             if ! mount | grep -q " on $part "; then
-                log_warn "$part partition creation requires manual intervention"
+                if [ -d "$part" ] && is_on_root_filesystem "$part"; then
+                    log_info "$part is on root filesystem - will create bind mount"
+                fi
             fi
         fi
         
-        # Check options if partition exists
-        if mount | grep -q " on $part "; then
-            check_partition "$part" "nodev"
-            check_partition "$part" "nosuid"
-            if [ "$part" != "/var" ]; then
-                check_partition "$part" "noexec"
+        # Check/fix options based on directory
+        if [ "$MODE" = "fix" ]; then
+            if [ "$part" = "/var" ]; then
+                check_partition_with_options "$part" "nodev" "nosuid"
+            else
+                check_partition_with_options "$part" "nodev" "nosuid" "noexec"
+            fi
+        else
+            if mount | grep -q " on $part " || [ -d "$part" ]; then
+                check_partition "$part" "nodev"
+                check_partition "$part" "nosuid"
+                if [ "$part" != "/var" ]; then
+                    check_partition "$part" "noexec"
+                fi
             fi
         fi
     done
@@ -406,6 +600,21 @@ main() {
         check_home_partition
         check_var_partitions
         
+        # Apply all fstab changes at once if any were made
+        if [ "$MODE" = "fix" ] && [ "$FSTAB_MODIFIED" = "true" ]; then
+            echo ""
+            log_info "========================================================================"
+            log_info "Applying fstab changes..."
+            log_info "========================================================================"
+            
+            if mount -a 2>/dev/null; then
+                log_pass "Successfully applied all fstab changes (mount -a)"
+            else
+                log_error "Failed to apply some fstab changes - check /etc/fstab for errors"
+                log_info "You can restore the backup from: $BACKUP_DIR"
+            fi
+        fi
+        
         echo ""
         echo "========================================================================"
         echo "Summary"
@@ -423,7 +632,12 @@ main() {
             fi
         else
             echo "Fixed: $FIXED_CHECKS"
-            log_info "Fixes applied. Run 'scan' mode to verify."
+            if [ "$FSTAB_MODIFIED" = "true" ]; then
+                log_info "Fstab has been modified. Changes applied with 'mount -a'."
+                log_info "Run 'scan' mode to verify all changes."
+            else
+                log_info "No fstab changes were necessary."
+            fi
         fi
         
     elif [ "$MODE" = "rollback" ]; then
@@ -433,6 +647,23 @@ main() {
         for module in cramfs freevxfs hfs hfsplus jffs2 overlayfs squashfs udf usb-storage; do
             check_kernel_module "$module"
         done
+        
+        # Restore latest fstab backup
+        local latest_backup=$(ls -t "$BACKUP_DIR"/fstab.* 2>/dev/null | head -1)
+        if [ -n "$latest_backup" ]; then
+            cp "$latest_backup" /etc/fstab
+            log_info "Restored fstab from backup: $latest_backup"
+            
+            # Unmount bind mounts before remounting
+            for part in /var/log/audit /var/log /var/tmp /var /home /tmp; do
+                if mount | grep -q " on $part " && mount | grep " on $part " | grep -q "bind"; then
+                    umount "$part" 2>/dev/null
+                fi
+            done
+            
+            mount -a 2>/dev/null
+            log_info "Reapplied fstab mounts"
+        fi
         
         log_info "Rollback completed"
     else
