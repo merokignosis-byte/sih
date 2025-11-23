@@ -21,15 +21,15 @@ class HardeningController:
         self.output_dir.mkdir(exist_ok=True)
         
         self.topics = {
-            "1": {"name": "Filesystem", "script": "01_filesystem.sh"},
-            "2": {"name": "Package Management", "script": "02_package_management.sh"},
-            "3": {"name": "Services", "script": "03_services.sh"},
-            "4": {"name": "Network", "script": "04_network.sh"},
-            "5": {"name": "Host Based Firewall", "script": "05_firewall.sh"},
-            "6": {"name": "Access Control", "script": "06_access_control.sh"},
-            "7": {"name": "User Accounts", "script": "07_user_accounts.sh"},
-            "8": {"name": "Logging and Auditing", "script": "08_logging_auditing.sh"},
-            "9": {"name": "System Maintenance", "script": "09_system_maintenance.sh"}
+            "1": {"name": "Filesystem", "script": "filesystem.sh"},
+            "2": {"name": "Package Management", "script": "package_mgmt.sh"},
+            "3": {"name": "Services", "script": "services.sh"},
+            "4": {"name": "Network", "script": "network.sh"},
+            "5": {"name": "Host Based Firewall", "script": "firewall.sh"},
+            "6": {"name": "Access Control", "script": "access_control.sh"},
+            "7": {"name": "User Accounts", "script": "user_accounts.sh"},
+            "8": {"name": "Logging and Auditing", "script": "logging_auditing.sh"},
+            "9": {"name": "System Maintenance", "script": "system_maintenance.sh"}
         }
         
         self.init_database()
