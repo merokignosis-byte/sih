@@ -98,16 +98,9 @@ check_kernel_module() {
         # Check if install directive exists with /bin/false or /bin/true
         if grep -rq "^[[:space:]]*install[[:space:]]\+$module[[:space:]]\+/bin/false" /etc/modprobe.d/ || \
            grep -rq "^[[:space:]]*install[[:space:]]\+$module[[:space:]]\+/bin/true" /etc/modprobe.d/; then
-            # Check if module is also blacklisted
-            if grep -rq "^[[:space:]]*blacklist[[:space:]]\+$module" /etc/modprobe.d/; then
-                log_pass "Module $module is properly disabled (install directive and blacklist found)"
-                ((PASSED_CHECKS++))
-                return 0
-            else
-                log_pass "Module $module has install directive but blacklist entry is missing"
-                ((PASSED_CHECKS++))
-                return 0
-            fi
+            log_pass "Module $module is properly disabled (install directive found)"
+            ((PASSED_CHECKS++))
+            return 0
         else
             log_error "Module $module is not properly disabled (no install directive found)"
             ((FAILED_CHECKS++))
@@ -151,6 +144,7 @@ EOF
         fi
     fi
 }
+
 check_all_kernel_modules() {
     log_info "=== Checking Filesystem Kernel Modules ==="
     
@@ -172,7 +166,7 @@ check_all_kernel_modules() {
 check_partition() {
     local partition="$1"
     local option="$2"
-    local rule_id="FS-PART-$(echo $partition | tr '/' '-' | tr '[:lower:]' '[:upper:]')-$option"
+    local rule_id="FS-PART-$(echo $partition | tr '/' '-' | tr '[:lower:]' '[:upper:]')-$(echo $option | tr '[:lower:]' '[:upper:]')"
     local rule_name="Ensure $option option set on $partition partition"
     
     ((TOTAL_CHECKS++))
@@ -183,14 +177,14 @@ check_partition() {
     
     if [ "$MODE" = "scan" ]; then
         # Check if partition exists
-        if ! mount | grep -q " $partition "; then
+        if ! mount | grep -q " on $partition "; then
             log_warn "Partition $partition does not exist or is not mounted"
             ((FAILED_CHECKS++))
             return 1
         fi
         
-        # Check for specific option
-        if mount | grep " $partition " | grep -q "$option"; then
+        # Check for specific option in mount output
+        if mount | grep " on $partition " | grep -q "$option"; then
             log_pass "Partition $partition has $option option"
             ((PASSED_CHECKS++))
             return 0
@@ -201,8 +195,14 @@ check_partition() {
         fi
         
     elif [ "$MODE" = "fix" ]; then
+        # Check if partition exists first
+        if ! mount | grep -q " on $partition "; then
+            log_warn "Partition $partition does not exist - cannot apply $option option"
+            return 1
+        fi
+        
         # Save current state
-        local current_opts=$(mount | grep " $partition " | sed 's/.*(\(.*\))/\1/')
+        local current_opts=$(mount | grep " on $partition " | sed 's/.*(\(.*\))/\1/')
         save_config "$rule_id" "$rule_name" "$current_opts"
         
         # Backup fstab
@@ -210,16 +210,29 @@ check_partition() {
         
         # Check if partition entry exists in fstab
         if grep -q " $partition " /etc/fstab; then
-            # Add option if not present
-            if ! grep " $partition " /etc/fstab | grep -q "$option"; then
-                sed -i "/ $partition / s/defaults/defaults,$option/" /etc/fstab
+            # Check if option already present in fstab
+            if grep " $partition " /etc/fstab | grep -q "$option"; then
+                log_info "$partition already has $option in fstab"
+            else
+                # Add option - handle different fstab formats
+                if grep " $partition " /etc/fstab | grep -q "defaults"; then
+                    # Add to defaults
+                    sed -i "/ $partition /s/defaults/defaults,$option/" /etc/fstab
+                else
+                    # Get current options and append
+                    local fstab_opts=$(grep " $partition " /etc/fstab | awk '{print $4}')
+                    sed -i "/ $partition /s/$fstab_opts/$fstab_opts,$option/" /etc/fstab
+                fi
                 log_info "Added $option to $partition in /etc/fstab"
-                
-                # Remount partition
-                mount -o remount "$partition" 2>/dev/null
+            fi
+            
+            # Remount partition with new options
+            if mount -o remount,"$option" "$partition" 2>/dev/null; then
+                log_info "Successfully remounted $partition with $option option"
                 ((FIXED_CHECKS++))
             else
-                log_info "$partition already has $option in fstab"
+                log_warn "Failed to remount $partition - may require reboot"
+                ((FIXED_CHECKS++))
             fi
         else
             log_warn "Partition $partition not found in /etc/fstab - manual configuration required"
@@ -251,36 +264,59 @@ check_tmp_partition() {
     echo "Rule ID: $rule_id"
     
     if [ "$MODE" = "scan" ]; then
-        if mount | grep -q "on /tmp "; then
+        if mount | grep -q " on /tmp "; then
             log_pass "/tmp is a separate partition"
             ((PASSED_CHECKS++))
-            
-            # Check options
-            check_partition "/tmp" "nodev"
-            check_partition "/tmp" "nosuid"
-            check_partition "/tmp" "noexec"
         else
             log_error "/tmp is not a separate partition"
             ((FAILED_CHECKS++))
         fi
     elif [ "$MODE" = "fix" ]; then
-        if ! mount | grep -q "on /tmp "; then
+        if ! mount | grep -q " on /tmp "; then
             log_warn "/tmp partition creation requires manual intervention"
             log_info "Consider using systemd tmp.mount or creating a dedicated partition"
-        else
-            check_partition "/tmp" "nodev"
-            check_partition "/tmp" "nosuid"
-            check_partition "/tmp" "noexec"
         fi
+    fi
+    
+    # Check options if partition exists
+    if mount | grep -q " on /tmp "; then
+        check_partition "/tmp" "nodev"
+        check_partition "/tmp" "nosuid"
+        check_partition "/tmp" "noexec"
     fi
 }
 
 check_dev_shm_partition() {
     log_info "=== Checking /dev/shm Partition ==="
     
-    check_partition "/dev/shm" "nodev"
-    check_partition "/dev/shm" "nosuid"
-    check_partition "/dev/shm" "noexec"
+    local rule_id="FS-DEVSHM-SEPARATE"
+    local rule_name="Ensure /dev/shm exists"
+    
+    ((TOTAL_CHECKS++))
+    echo ""
+    echo "Checking: $rule_name"
+    echo "Rule ID: $rule_id"
+    
+    if [ "$MODE" = "scan" ]; then
+        if mount | grep -q " on /dev/shm "; then
+            log_pass "/dev/shm is mounted"
+            ((PASSED_CHECKS++))
+        else
+            log_error "/dev/shm is not mounted"
+            ((FAILED_CHECKS++))
+        fi
+    elif [ "$MODE" = "fix" ]; then
+        if ! mount | grep -q " on /dev/shm "; then
+            log_warn "/dev/shm is not mounted - this is unusual"
+        fi
+    fi
+    
+    # Check options if partition exists
+    if mount | grep -q " on /dev/shm "; then
+        check_partition "/dev/shm" "nodev"
+        check_partition "/dev/shm" "nosuid"
+        check_partition "/dev/shm" "noexec"
+    fi
 }
 
 check_home_partition() {
@@ -295,23 +331,23 @@ check_home_partition() {
     echo "Rule ID: $rule_id"
     
     if [ "$MODE" = "scan" ]; then
-        if mount | grep -q "on /home "; then
+        if mount | grep -q " on /home "; then
             log_pass "/home is a separate partition"
             ((PASSED_CHECKS++))
-            
-            check_partition "/home" "nodev"
-            check_partition "/home" "nosuid"
         else
             log_warn "/home is not a separate partition (recommended)"
             ((FAILED_CHECKS++))
         fi
     elif [ "$MODE" = "fix" ]; then
-        if ! mount | grep -q "on /home "; then
+        if ! mount | grep -q " on /home "; then
             log_warn "/home partition creation requires manual intervention"
-        else
-            check_partition "/home" "nodev"
-            check_partition "/home" "nosuid"
         fi
+    fi
+    
+    # Check options if partition exists
+    if mount | grep -q " on /home "; then
+        check_partition "/home" "nodev"
+        check_partition "/home" "nosuid"
     fi
 }
 
@@ -329,28 +365,25 @@ check_var_partitions() {
         echo "Rule ID: $rule_id"
         
         if [ "$MODE" = "scan" ]; then
-            if mount | grep -q "on $part "; then
+            if mount | grep -q " on $part "; then
                 log_pass "$part is a separate partition"
                 ((PASSED_CHECKS++))
-                
-                check_partition "$part" "nodev"
-                check_partition "$part" "nosuid"
-                if [ "$part" != "/var" ]; then
-                    check_partition "$part" "noexec"
-                fi
             else
                 log_warn "$part is not a separate partition (recommended)"
                 ((FAILED_CHECKS++))
             fi
         elif [ "$MODE" = "fix" ]; then
-            if mount | grep -q "on $part "; then
-                check_partition "$part" "nodev"
-                check_partition "$part" "nosuid"
-                if [ "$part" != "/var" ]; then
-                    check_partition "$part" "noexec"
-                fi
-            else
+            if ! mount | grep -q " on $part "; then
                 log_warn "$part partition creation requires manual intervention"
+            fi
+        fi
+        
+        # Check options if partition exists
+        if mount | grep -q " on $part "; then
+            check_partition "$part" "nodev"
+            check_partition "$part" "nosuid"
+            if [ "$part" != "/var" ]; then
+                check_partition "$part" "noexec"
             fi
         fi
     done
