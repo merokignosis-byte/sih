@@ -141,43 +141,6 @@ check_journald_compression() {
 # 8.2 System Logging - rsyslog
 # ============================================================================
 
-check_rsyslog_installed() {
-    local rule_id="LOG-RSYSLOG-INSTALLED"
-    local rule_name="Ensure rsyslog is installed"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        if dpkg -l | grep -q "^ii.*rsyslog"; then
-            log_pass "rsyslog is installed"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "rsyslog is not installed"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        if ! dpkg -l | grep -q "^ii.*rsyslog"; then
-            save_config "$rule_id" "$rule_name" "not_installed"
-            apt-get install -y rsyslog
-            log_info "Installed rsyslog"
-            ((FIXED_CHECKS++))
-        fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        local original=$(get_original_config "$rule_id")
-        if [ "$original" = "not_installed" ]; then
-            apt-get remove -y rsyslog
-            log_info "Removed rsyslog"
-        fi
-    fi
-}
-
 check_rsyslog_enabled() {
     local rule_id="LOG-RSYSLOG-ENABLED"
     local rule_name="Ensure rsyslog service is enabled and active"
@@ -188,30 +151,124 @@ check_rsyslog_enabled() {
     echo "Rule ID: $rule_id"
     
     if [ "$MODE" = "scan" ]; then
+        # Check if service is masked first
+        if systemctl is-enabled rsyslog 2>&1 | grep -q "masked"; then
+            log_error "rsyslog service is masked (disabled by system)"
+            ((FAILED_CHECKS++))
+            return 1
+        fi
+        
         if systemctl is-enabled rsyslog 2>/dev/null | grep -q "enabled" && \
            systemctl is-active rsyslog 2>/dev/null | grep -q "active"; then
             log_pass "rsyslog is enabled and active"
             ((PASSED_CHECKS++))
             return 0
         else
-            log_error "rsyslog is not properly configured"
+            local enabled_status=$(systemctl is-enabled rsyslog 2>&1)
+            local active_status=$(systemctl is-active rsyslog 2>&1)
+            log_error "rsyslog service not properly configured (enabled: $enabled_status, active: $active_status)"
             ((FAILED_CHECKS++))
             return 1
         fi
         
     elif [ "$MODE" = "fix" ]; then
-        save_config "$rule_id" "$rule_name" "not_enabled"
-        systemctl enable rsyslog
-        systemctl start rsyslog
-        log_info "Enabled and started rsyslog"
-        ((FIXED_CHECKS++))
+        local service_status=$(systemctl is-enabled rsyslog 2>&1)
+        local was_masked=false
+        local was_disabled=false
+        
+        # Check if service is masked
+        if echo "$service_status" | grep -q "masked"; then
+            log_warn "rsyslog service is masked - this typically means systemd-journald is preferred"
+            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_manual "CONFLICT DETECTED: rsyslog is masked by systemd"
+            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_manual "Your system is using systemd-journald for logging."
+            log_manual "Both rsyslog and systemd-journald provide logging services."
+            log_manual ""
+            log_manual "WHY IS THIS MASKED?"
+            log_manual "- systemd masked rsyslog to prevent conflicts"
+            log_manual "- Only ONE logging daemon should run at a time"
+            log_manual "- Modern systems prefer systemd-journald"
+            log_manual ""
+            log_manual "OPTIONS:"
+            log_manual "1. Keep systemd-journald (RECOMMENDED for modern systems)"
+            log_manual "   - No action needed"
+            log_manual "   - Complies with audit requirements via journald"
+            log_manual ""
+            log_manual "2. Switch to rsyslog (if specifically required)"
+            log_manual "   Run these commands manually:"
+            log_manual "   sudo systemctl unmask rsyslog"
+            log_manual "   sudo systemctl stop systemd-journald"
+            log_manual "   sudo systemctl disable systemd-journald"
+            log_manual "   sudo systemctl enable rsyslog"
+            log_manual "   sudo systemctl start rsyslog"
+            log_manual ""
+            log_manual "3. Use both (dual logging - uses more disk space)"
+            log_manual "   sudo systemctl unmask rsyslog"
+            log_manual "   sudo systemctl enable rsyslog"
+            log_manual "   sudo systemctl start rsyslog"
+            log_manual "   Configure journald to forward to rsyslog:"
+            log_manual "   echo 'ForwardToSyslog=yes' >> /etc/systemd/journald.conf"
+            log_manual "   sudo systemctl restart systemd-journald"
+            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ((MANUAL_CHECKS++))
+            was_masked=true
+            save_config "$rule_id" "$rule_name" "masked"
+            return 2
+        fi
+        
+        # Service is not masked - safe to enable
+        save_config "$rule_id" "$rule_name" "$service_status"
+        
+        # Check if already enabled and active
+        if systemctl is-enabled rsyslog 2>/dev/null | grep -q "enabled" && \
+           systemctl is-active rsyslog 2>/dev/null | grep -q "active"; then
+            log_info "rsyslog is already enabled and active"
+            return 0
+        fi
+        
+        # Enable the service
+        if ! systemctl is-enabled rsyslog 2>/dev/null | grep -q "enabled"; then
+            log_info "Enabling rsyslog service..."
+            if systemctl enable rsyslog 2>&1 | tee /tmp/rsyslog_enable.log; then
+                log_pass "rsyslog service enabled"
+            else
+                log_error "Failed to enable rsyslog - check /tmp/rsyslog_enable.log"
+                return 1
+            fi
+        fi
+        
+        # Start the service
+        if ! systemctl is-active rsyslog 2>/dev/null | grep -q "active"; then
+            log_info "Starting rsyslog service..."
+            if systemctl start rsyslog 2>&1 | tee /tmp/rsyslog_start.log; then
+                log_pass "rsyslog service started"
+                ((FIXED_CHECKS++))
+            else
+                log_error "Failed to start rsyslog - check /tmp/rsyslog_start.log"
+                log_error "Check status with: systemctl status rsyslog"
+                return 1
+            fi
+        fi
         
     elif [ "$MODE" = "rollback" ]; then
+        local original=$(get_original_config "$rule_id")
+        
+        if [ "$original" = "masked" ]; then
+            log_info "Service was originally masked - not rolling back"
+            return 0
+        fi
+        
+        log_info "Disabling rsyslog service..."
         systemctl disable rsyslog 2>/dev/null
         systemctl stop rsyslog 2>/dev/null
-        log_info "Disabled rsyslog"
+        log_info "Disabled and stopped rsyslog"
     fi
 }
+
+# ============================================================================
+# Safe rsyslog File Permissions Configuration
+# ============================================================================
 
 check_rsyslog_file_permissions() {
     local rule_id="LOG-RSYSLOG-PERMS"
@@ -223,39 +280,133 @@ check_rsyslog_file_permissions() {
     echo "Rule ID: $rule_id"
     
     if [ "$MODE" = "scan" ]; then
-        if grep -q '^\$FileCreateMode 0640' /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null; then
-            log_pass "rsyslog file permissions configured"
+        # Check both rsyslog.conf and drop-in files
+        if grep -q '^\$FileCreateMode 0640' /etc/rsyslog.conf 2>/dev/null || \
+           grep -rq '^\$FileCreateMode 0640' /etc/rsyslog.d/ 2>/dev/null; then
+            log_pass "rsyslog file creation mode is configured (0640)"
             ((PASSED_CHECKS++))
             return 0
         else
-            log_error "rsyslog file permissions not configured"
+            log_error "rsyslog file creation mode is not configured"
             ((FAILED_CHECKS++))
             return 1
         fi
         
     elif [ "$MODE" = "fix" ]; then
-        cp /etc/rsyslog.conf "$BACKUP_DIR/rsyslog.conf.$(date +%Y%m%d_%H%M%S)"
-        save_config "$rule_id" "$rule_name" "not_configured"
-        
-        if ! grep -q '^\$FileCreateMode' /etc/rsyslog.conf; then
-            echo '$FileCreateMode 0640' >> /etc/rsyslog.conf
-        else
-            sed -i 's/^\$FileCreateMode.*/$FileCreateMode 0640/' /etc/rsyslog.conf
+        # Check if rsyslog is installed first
+        if ! command -v rsyslogd &> /dev/null; then
+            log_warn "rsyslog is not installed - cannot configure file permissions"
+            ((MANUAL_CHECKS++))
+            return 2
         fi
         
-        systemctl restart rsyslog
-        log_info "Configured rsyslog file permissions"
-        ((FIXED_CHECKS++))
+        # Check if rsyslog.conf exists
+        if [ ! -f /etc/rsyslog.conf ]; then
+            log_error "rsyslog.conf not found - rsyslog may not be properly installed"
+            return 1
+        fi
+        
+        # Create backup
+        local backup_file="$BACKUP_DIR/rsyslog.conf.$(date +%Y%m%d_%H%M%S)"
+        if cp /etc/rsyslog.conf "$backup_file" 2>/dev/null; then
+            log_info "Created backup: $backup_file"
+        else
+            log_error "Failed to create backup of rsyslog.conf"
+            return 1
+        fi
+        
+        # Get current configuration
+        local current_config=""
+        if grep -q '^\$FileCreateMode' /etc/rsyslog.conf; then
+            current_config=$(grep '^\$FileCreateMode' /etc/rsyslog.conf | head -1)
+        else
+            current_config="not_set"
+        fi
+        save_config "$rule_id" "$rule_name" "$current_config"
+        
+        # Apply configuration
+        if grep -q '^\$FileCreateMode' /etc/rsyslog.conf; then
+            # Setting exists - update it
+            log_info "Updating existing FileCreateMode setting..."
+            sed -i 's/^\$FileCreateMode.*/$FileCreateMode 0640/' /etc/rsyslog.conf
+        else
+            # Setting doesn't exist - add it
+            log_info "Adding FileCreateMode setting..."
+            
+            # Find a good place to add it (after global directives, before rules)
+            if grep -q '^#### GLOBAL DIRECTIVES' /etc/rsyslog.conf; then
+                # Add after global directives section
+                sed -i '/^#### GLOBAL DIRECTIVES/a\
+\
+# Set default permissions for log files\
+$FileCreateMode 0640' /etc/rsyslog.conf
+            else
+                # Add at the beginning after comments
+                sed -i '1a\
+\
+# Set default permissions for log files\
+$FileCreateMode 0640' /etc/rsyslog.conf
+            fi
+        fi
+        
+        # Validate configuration
+        log_info "Validating rsyslog configuration..."
+        if rsyslogd -N1 &>/dev/null; then
+            log_pass "rsyslog configuration is valid"
+        else
+            log_error "rsyslog configuration validation failed"
+            log_error "Restoring backup..."
+            cp "$backup_file" /etc/rsyslog.conf
+            return 1
+        fi
+        
+        # Restart rsyslog to apply changes
+        log_info "Restarting rsyslog service..."
+        if systemctl restart rsyslog 2>&1 | tee /tmp/rsyslog_restart.log; then
+            log_pass "rsyslog restarted successfully"
+            ((FIXED_CHECKS++))
+            
+            # Verify service is running
+            sleep 1
+            if systemctl is-active rsyslog 2>/dev/null | grep -q "active"; then
+                log_pass "rsyslog is active and running"
+            else
+                log_error "rsyslog failed to start after restart"
+                log_error "Check logs: journalctl -u rsyslog -n 50"
+                return 1
+            fi
+        else
+            log_error "Failed to restart rsyslog"
+            log_error "Check /tmp/rsyslog_restart.log for details"
+            log_error "Restoring backup configuration..."
+            cp "$backup_file" /etc/rsyslog.conf
+            systemctl restart rsyslog
+            return 1
+        fi
         
     elif [ "$MODE" = "rollback" ]; then
         local backup=$(ls -t "$BACKUP_DIR"/rsyslog.conf.* 2>/dev/null | head -1)
         if [ -n "$backup" ]; then
-            cp "$backup" /etc/rsyslog.conf
-            systemctl restart rsyslog
-            log_info "Restored rsyslog configuration"
+            log_info "Restoring rsyslog configuration from: $backup"
+            if cp "$backup" /etc/rsyslog.conf; then
+                log_info "Configuration restored"
+                
+                # Validate before restarting
+                if rsyslogd -N1 &>/dev/null; then
+                    systemctl restart rsyslog
+                    log_info "rsyslog restarted with original configuration"
+                else
+                    log_error "Restored configuration is invalid"
+                fi
+            else
+                log_error "Failed to restore backup"
+            fi
+        else
+            log_warn "No backup found to restore"
         fi
     fi
 }
+
 
 check_logrotate() {
     local rule_id="LOG-LOGROTATE"
