@@ -132,9 +132,9 @@ get_mount_options() {
 
 # Check if mount has specific option
 has_mount_option() {
-    local partition="$1"
+    local options_list="$1"
     local option="$2"
-    mount | grep " on $partition " | grep -q "$option" 2>/dev/null
+    echo "$options_list" | grep -qw "$option"
 }
 
 # Check if partition is mounted
@@ -285,131 +285,134 @@ check_partition_exists() {
     fi
 }
 
-check_partition_option() {
+check_partition_options() {
     local partition="$1"
-    local option="$2"
-    local rule_id="FS-PART-$(echo $partition | tr '/' '-' | tr '[:lower:]' '[:upper:]')-$(echo $option | tr '[:lower:]' '[:upper:]')"
-    local rule_name="Ensure $option option set on $partition partition"
-    
+    local rule_id="FS-PART-$(echo $partition | tr '/' '-' | tr '[:lower:]' '[:upper:]')-OPTS"
+    # Specific options depend on the partition
+    local required_options=""
+    case "$partition" in
+        "/tmp"|"/var/tmp"|"/dev/shm")
+            required_options="nodev noexec nosuid"
+            ;;
+        "/home")
+            required_options="nodev noexec nosuid"
+            ;;
+        "/var/log"|"/var/log/audit")
+            required_options="nodev noexec"
+            ;;
+        *)
+            # Skip if not a standard target
+            return 0
+            ;;
+    esac
+
+    local rule_name="Ensure $partition has $required_options options set"
+
     ((TOTAL_CHECKS++))
-    
     echo ""
     echo "Checking: $rule_name"
     echo "Rule ID: $rule_id"
     
-    # Pre-flight checks
-    if [ ! -d "$partition" ]; then
-        log_warn "Directory $partition does not exist - skipping $option check"
+    if [ ! -d "$partition" ] && [ "$partition" != "/dev/shm" ]; then
+        log_warn "Directory $partition does not exist, skipping mount options check."
+        ((MANUAL_CHECKS++))
+        return 2
+    fi
+
+    # Handle systemd-managed /dev/shm which might not be in fstab
+    if [ "$partition" == "/dev/shm" ] && ! fstab_has_entry "$partition"; then
+        log_manual "/dev/shm is likely managed by systemd-tmpfiles. Manual config required in /etc/systemd/system/tmp.mount.d/override.conf."
         ((MANUAL_CHECKS++))
         return 2
     fi
     
-    if [ "$MODE" = "scan" ]; then
-        # Check if partition is mounted
-        if ! is_mounted "$partition"; then
-            log_warn "Partition $partition is not mounted - cannot check $option"
-            ((FAILED_CHECKS++))
-            return 1
+    local all_found=true
+    local current_options_fstab=$(grep "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab | awk '{print $4}' 2>/dev/null)
+
+    if [ -z "$current_options_fstab" ]; then
+        # If no fstab entry found, rely on currently mounted options (less reliable for fix logic)
+        current_options_fstab=$(get_mount_options "$partition")
+        if [ -z "$current_options_fstab" ]; then
+             log_manual "Cannot determine current mount options for $partition. Manual review required."
+             ((MANUAL_CHECKS++))
+             return 2
         fi
-        
-        # Check for specific option in mount output
-        if has_mount_option "$partition" "$option"; then
-            log_pass "Partition $partition has $option option"
+    fi
+
+    for opt in $required_options; do
+        if ! has_mount_option "$current_options_fstab" "$opt"; then
+            all_found=false
+            break
+        fi
+    done
+
+    if [ "$MODE" = "scan" ]; then
+        if $all_found; then
+            log_pass "$partition has all required options: $required_options"
+            ((PASSED_CHECKS++))
+        else
+            log_error "$partition is missing required options: $required_options. Current in fstab: ($current_options_fstab)"
+            ((FAILED_CHECKS++))
+        fi
+
+    elif [ "$MODE" = "fix" ]; then
+        # Save current state (the full fstab line) before modification for rollback
+        local original_fstab_line=$(grep "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab)
+        save_config "$rule_id" "$rule_name" "$original_fstab_line"
+
+        if $all_found; then
+            log_pass "$partition already has all required options. No fix needed."
             ((PASSED_CHECKS++))
             return 0
-        else
-            log_error "Partition $partition missing $option option"
-            ((FAILED_CHECKS++))
-            return 1
         fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        # CRITICAL: Only fix mount options if partition exists in fstab
-        # Never create new partitions automatically
-        
-        if ! is_mounted "$partition"; then
-            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            log_manual "MANUAL ACTION REQUIRED: $partition is not mounted"
-            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            log_manual "To create a separate partition for $partition:"
-            log_manual "1. Create a new partition using fdisk/parted/LVM"
-            log_manual "2. Format the partition: mkfs.ext4 /dev/sdXN"
-            log_manual "3. Backup current data: rsync -avx $partition/ /mnt/temp/"
-            log_manual "4. Add to /etc/fstab: /dev/sdXN $partition ext4 defaults,$option 0 2"
-            log_manual "5. Mount: mount $partition"
-            log_manual "6. Restore data: rsync -avx /mnt/temp/ $partition/"
-            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            ((MANUAL_CHECKS++))
-            return 2
-        fi
-        
-        # Check if partition has an entry in fstab
-        if ! fstab_has_entry "$partition"; then
-            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            log_manual "MANUAL ACTION REQUIRED: $partition not in /etc/fstab"
-            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            log_manual "Partition $partition is mounted but has no fstab entry."
-            log_manual "To add mount options manually:"
-            log_manual "1. Identify the device: findmnt $partition"
-            log_manual "2. Add entry to /etc/fstab with options: $option"
-            log_manual "3. Test with: mount -o remount,$option $partition"
-            log_manual "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            ((MANUAL_CHECKS++))
-            return 2
-        fi
-        
-        # Partition exists in fstab - we can safely modify options
-        local current_opts=$(get_mount_options "$partition")
-        
-        # Check if option already exists
-        if echo "$current_opts" | grep -q "\b$option\b"; then
-            log_info "$partition already has $option option"
-            return 0
-        fi
-        
-        # Backup fstab before modification
-        if [ "$FSTAB_MODIFIED" = "false" ]; then
-            local backup_file="$BACKUP_DIR/fstab.$(date +%Y%m%d_%H%M%S)"
-            if cp /etc/fstab "$backup_file" 2>/dev/null; then
-                log_info "Created fstab backup: $backup_file"
-            else
-                log_error "Failed to create fstab backup - aborting"
-                return 1
+
+        log_info "Attempting to add missing options to $partition"
+
+        local options_to_add=""
+        for opt in $required_options; do
+            if ! has_mount_option "$current_options_fstab" "$opt"; then
+                options_to_add="$options_to_add,$opt"
             fi
-        fi
+        done
+        # Remove leading comma for clean addition
+        options_to_add=$(echo "$options_to_add" | sed 's/^,//')
+
+        # Use awk to reliably replace the 4th column by appending options
+        # We redirect the output to a temp file and then overwrite the original
+        awk -v partition="$partition" -v opts="$options_to_add" '
+        $2 == partition {
+            # Check if options column has something other than "defaults" or is empty
+            if ($4 == "defaults" || $4 == "") {
+                $4 = "defaults," opts
+            } else {
+                $4 = $4 "," opts
+            }
+            # Reconstruct the line with original spacing might be difficult with awk, just use single spaces
+            # Better approach: let awk reformat with single spaces, which is fine for fstab
+        }
+        { print }
+        ' /etc/fstab > /tmp/fstab.tmp && mv /tmp/fstab.tmp /etc/fstab
         
-        # Save original state
-        save_config "$rule_id" "$rule_name" "$current_opts"
-        
-        # Add the option to existing fstab entry
-        # This sed command finds the line and adds the option to the mount options column
-        if sed -i.bak "/^[^#]*[[:space:]]$(echo $partition | sed 's/\//\\\//g')[[:space:]]/s/\([[:space:]][^[:space:]]*[[:space:]][^[:space:]]*[[:space:]]\)\([^[:space:]]*\)/\1\2,$option/" /etc/fstab 2>/dev/null; then
-            log_info "Added $option to $partition in /etc/fstab"
+        if [ $? -eq 0 ]; then
+            log_info "fstab updated for $partition with new options: $options_to_add."
             FSTAB_MODIFIED=true
             ((FIXED_CHECKS++))
-            
-            # Validate fstab syntax
-            if ! validate_fstab; then
-                log_error "fstab validation failed - restoring backup"
-                mv /etc/fstab.bak /etc/fstab
-                FSTAB_MODIFIED=false
-                return 1
-            fi
-            rm -f /etc/fstab.bak
         else
-            log_error "Failed to modify /etc/fstab for $partition"
-            return 1
+            log_error "Failed to update fstab automatically for $partition using awk."
         fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        local original=$(get_original_config "$rule_id")
-        if [ -n "$original" ]; then
-            # Find most recent backup
-            local latest_backup=$(ls -t "$BACKUP_DIR"/fstab.* 2>/dev/null | head -1)
-            if [ -n "$latest_backup" ]; then
-                cp "$latest_backup" /etc/fstab
-                log_info "Restored fstab entry for $partition"
-            fi
+
+    elif [ "$MODE" = "rollback" ];
+        # ... (rollback logic provided previously is fine) ...
+        local original_fstab_line=$(get_original_config "$rule_id")
+
+        if [ -n "$original_fstab_line" ]; then
+             # Remove existing line and add the original back
+             sed -i "/[[:space:]]$partition[[:space:]]/d" /etc/fstab
+             echo "$original_fstab_line" >> /etc/fstab
+             log_info "Rolled back $FSTAB_FILE configuration for $partition"
+             FSTAB_MODIFIED=true
+        else
+             log_warn "No original config found for $rule_id to rollback."
         fi
     fi
 }
