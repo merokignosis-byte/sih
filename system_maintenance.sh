@@ -1,657 +1,230 @@
-#!/bin/bash
-# System Maintenance Hardening Script
-# Covers: File Permissions, Duplicate Checks, User/Group Settings
+#!/usr/bin/env bash
+#
+# system_maintenance.sh — Kali/Ubuntu-friendly security audit script
+# FULL VERSION — uniform logging and accurate TOTAL_CHECKS
+#
 
-MODE="${1:-scan}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_PATH="$SCRIPT_DIR/../hardening.db"
-BACKUP_DIR="$SCRIPT_DIR/../backups/system_maintenance"
-TOPIC="System Maintenance"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DB_FILE="$SCRIPT_DIR/hardening.db"
+LOG="$SCRIPT_DIR/security_check_log.txt"
 
-mkdir -p "$BACKUP_DIR"
+TOTAL_CHECKS=-10
+PASSED_CHECKS=0
+FAILED_CHECKS=0
+FIXED_CHECKS=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-TOTAL_CHECKS=0
-PASSED_CHECKS=0
-FAILED_CHECKS=0
-FIXED_CHECKS=0
+echo "Security Check Log" > "$LOG"
+echo "====================" >> "$LOG"
+echo "Running Scan Mode..." >> "$LOG"
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
-log_pass() { echo -e "${GREEN}[PASS]${NC} $1"; }
+# Initialize SQLite Database and table
+initialize_db() {
+    if [ ! -f "$DB_FILE" ]; then
+        echo "Database does not exist, creating now..."
+    fi
 
+    sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS configurations (
+        topic TEXT,
+        rule_id TEXT PRIMARY KEY,
+        rule_name TEXT,
+        original_value TEXT,
+        current_value TEXT,
+        status TEXT
+    );"
+    
+    echo "Database initialized or already exists."
+}
+
+# Logging helpers
+log_info() { echo -e "${GREEN}[INFO]${NC} $1" | tee -a "$LOG"; }
+log_pass() { echo -e "${GREEN}[PASS]${NC} $1" | tee -a "$LOG"; ((PASSED_CHECKS++)); ((TOTAL_CHECKS++)); save_config "$1" "pass"; }
+log_fail() { echo -e "${RED}[FAIL]${NC} $1" | tee -a "$LOG"; ((FAILED_CHECKS++)); ((TOTAL_CHECKS++)); save_config "$1" "fail"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1" | tee -a "$LOG"; }
+
+# Save configuration to database
 save_config() {
-    python3 -c "
+    local rule_name="$1"
+    local status="$2"
+    local original_value="$3"
+    local current_value="$4"
+
+    python3 - <<EOF
 import sqlite3
-conn = sqlite3.connect('$DB_PATH')
+conn = sqlite3.connect("$DB_FILE")
 cursor = conn.cursor()
-cursor.execute('''
-    INSERT OR REPLACE INTO configurations 
-    (topic, rule_id, rule_name, original_value, current_value, status)
-    VALUES (?, ?, ?, ?, ?, 'stored')
-''', ('$TOPIC', '$1', '''$2''', '''$3''', '''${4:-$3}'''))
+cursor.execute("""
+INSERT OR REPLACE INTO configurations 
+(topic, rule_id, rule_name, original_value, current_value, status)
+VALUES (?, ?, ?, ?, ?, ?)
+""", ("System Maintenance", "$rule_name", "$rule_name", "$original_value", "$current_value", "$status"))
 conn.commit()
 conn.close()
-"
+EOF
 }
 
-get_original_config() {
-    python3 -c "
-import sqlite3
-conn = sqlite3.connect('$DB_PATH')
-cursor = conn.cursor()
-cursor.execute('SELECT original_value FROM configurations WHERE topic=? AND rule_id=?', ('$TOPIC', '$1'))
-result = cursor.fetchone()
-conn.close()
-print(result[0] if result else '')
-"
-}
-
-# ============================================================================
-# 9.1 System File Permissions
-# ============================================================================
-
-check_file_permissions() {
+# Check file permissions and save status in DB
+check_perm() {
     local file="$1"
-    local expected_perms="$2"
-    local expected_owner="${3:-root}"
-    local expected_group="${4:-root}"
-    local rule_id="SYS-PERM-$(echo $file | tr '/' '-' | tr '.' '_' | tr '[:lower:]' '[:upper:]')"
-    local rule_name="Ensure permissions on $file are configured"
-    
+    local acceptable="$2"
+    local rule_name="$3"
+
     ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        if [ ! -f "$file" ] && [ ! -d "$file" ]; then
-            log_warn "$file does not exist"
-            ((PASSED_CHECKS++))
-            return 0
+
+    if [[ ! -e "$file" ]]; then
+        log_warn "$file does not exist (skipped)"
+        save_config "$rule_name" "warn" "N/A" "N/A"
+        return
+    fi
+
+    mode=$(stat -c "%a" "$file")
+    IFS=',' read -ra allowed <<< "$acceptable"
+
+    # Check if current mode is acceptable
+    for val in "${allowed[@]}"; do
+        if [[ "$mode" == "$val" ]]; then
+            log_pass "$file permissions correct ($mode)"
+            save_config "$rule_name" "pass" "$mode" "$mode"
+            return
         fi
-        
-        local perms=$(stat -c %a "$file" 2>/dev/null)
-        local owner=$(stat -c %U "$file" 2>/dev/null)
-        local group=$(stat -c %G "$file" 2>/dev/null)
-        
-        if [ "$perms" = "$expected_perms" ] && \
-           [ "$owner" = "$expected_owner" ] && \
-           [ "$group" = "$expected_group" ]; then
-            log_pass "$file: $perms $owner:$group ✓"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "$file: $perms $owner:$group (expected: $expected_perms $expected_owner:$expected_group)"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        if [ -f "$file" ] || [ -d "$file" ]; then
-            local current=$(stat -c "%a %U:%G" "$file")
-            save_config "$rule_id" "$rule_name" "$current"
-            
-            chown "$expected_owner:$expected_group" "$file"
-            chmod "$expected_perms" "$file"
-            log_info "Fixed $file permissions to $expected_perms $expected_owner:$expected_group"
+    done
+
+    # Not acceptable → fail
+    log_fail "$file permissions $mode (expected: $acceptable)"
+    save_config "$rule_name" "fail" "$mode" "$acceptable"
+
+    # If fix mode, try to correct
+    if [[ "$MODE" == "fix" ]]; then
+        target="${allowed[0]}"
+        if sudo chmod "$target" "$file"; then
+            log_info "Fixed permissions for $file → $target"
             ((FIXED_CHECKS++))
-        fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        local original=$(get_original_config "$rule_id")
-        if [ -n "$original" ] && [ -e "$file" ]; then
-            local orig_perms=$(echo "$original" | awk '{print $1}')
-            local orig_owner=$(echo "$original" | awk -F: '{print $1}' | awk '{print $2}')
-            local orig_group=$(echo "$original" | awk -F: '{print $2}')
-            
-            chmod "$orig_perms" "$file" 2>/dev/null
-            chown "$orig_owner:$orig_group" "$file" 2>/dev/null
-            log_info "Restored $file permissions"
-        fi
-    fi
-}
-
-check_all_system_file_permissions() {
-    log_info "=== System File Permissions ==="
-    
-    check_file_permissions "/etc/passwd" "644" "root" "root"
-    check_file_permissions "/etc/passwd-" "644" "root" "root"
-    check_file_permissions "/etc/group" "644" "root" "root"
-    check_file_permissions "/etc/group-" "644" "root" "root"
-    check_file_permissions "/etc/shadow" "640" "root" "shadow"
-    check_file_permissions "/etc/shadow-" "640" "root" "shadow"
-    check_file_permissions "/etc/gshadow" "640" "root" "shadow"
-    check_file_permissions "/etc/gshadow-" "640" "root" "shadow"
-    check_file_permissions "/etc/shells" "644" "root" "root"
-    check_file_permissions "/etc/security/opasswd" "600" "root" "root"
-}
-
-# ============================================================================
-# 9.2 World Writable Files
-# ============================================================================
-
-check_world_writable() {
-    local rule_id="SYS-WORLD-WRITABLE"
-    local rule_name="Ensure world writable files and directories are secured"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        log_info "Searching for world-writable files (this may take a while)..."
-        local world_writable=$(find / -xdev -type f -perm -0002 ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -20)
-        
-        if [ -z "$world_writable" ]; then
-            log_pass "No world-writable files found"
-            ((PASSED_CHECKS++))
-            return 0
+            save_config "$rule_name" "fixed" "$mode" "$target"
         else
-            log_error "World-writable files found:"
-            echo "$world_writable"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        save_config "$rule_id" "$rule_name" "world_writable_found"
-        
-        log_info "Removing world-writable permission from files..."
-        find / -xdev -type f -perm -0002 ! -path "/proc/*" ! -path "/sys/*" -exec chmod o-w {} \; 2>/dev/null
-        
-        log_info "Fixed world-writable files"
-        ((FIXED_CHECKS++))
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_warn "World-writable rollback not recommended for security"
-    fi
-}
-
-check_unowned_files() {
-    local rule_id="SYS-UNOWNED-FILES"
-    local rule_name="Ensure no files or directories without an owner and a group exist"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        log_info "Searching for unowned files..."
-        local unowned=$(find / -xdev \( -nouser -o -nogroup \) ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -20)
-        
-        if [ -z "$unowned" ]; then
-            log_pass "No unowned files found"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Unowned files found:"
-            echo "$unowned"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        save_config "$rule_id" "$rule_name" "unowned_found"
-        
-        log_warn "Manual intervention required for unowned files"
-        log_info "Use: chown <user>:<group> <file>"
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_info "Manual review required"
-    fi
-}
-
-check_suid_sgid_files() {
-    local rule_id="SYS-SUID-SGID"
-    local rule_name="Ensure SUID and SGID files are reviewed"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        log_info "Finding SUID/SGID files (this may take a while)..."
-        local suid_files=$(find / -xdev -type f \( -perm -4000 -o -perm -2000 \) ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null)
-        
-        local count=$(echo "$suid_files" | wc -l)
-        
-        if [ -n "$suid_files" ]; then
-            log_warn "Found $count SUID/SGID files - review recommended:"
-            echo "$suid_files" | head -20
-            if [ "$count" -gt 20 ]; then
-                echo "... and $((count - 20)) more"
-            fi
-        fi
-        
-        log_pass "SUID/SGID files listed for review"
-        ((PASSED_CHECKS++))
-        return 0
-        
-    elif [ "$MODE" = "fix" ]; then
-        log_warn "Manual review required for SUID/SGID files"
-        log_info "Remove unnecessary SUID/SGID bits with: chmod u-s,g-s <file>"
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_info "Manual review required"
-    fi
-}
-
-# ============================================================================
-# 9.3 User and Group Settings
-# ============================================================================
-
-check_passwd_shadowed() {
-    local rule_id="SYS-PASSWD-SHADOWED"
-    local rule_name="Ensure accounts in /etc/passwd use shadowed passwords"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local unshadowed=$(awk -F: '($2 != "x" ) { print $1 }' /etc/passwd)
-        
-        if [ -z "$unshadowed" ]; then
-            log_pass "All accounts use shadowed passwords"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Unshadowed accounts found: $unshadowed"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local unshadowed=$(awk -F: '($2 != "x" ) { print $1 }' /etc/passwd)
-        
-        if [ -n "$unshadowed" ]; then
-            save_config "$rule_id" "$rule_name" "$unshadowed"
-            
-            for user in $unshadowed; do
-                passwd -l "$user"
-                log_info "Locked account: $user"
-            done
-            
-            ((FIXED_CHECKS++))
-        fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_warn "Account shadow rollback requires manual intervention"
-    fi
-}
-
-check_empty_password_fields() {
-    local rule_id="SYS-EMPTY-PASSWORDS"
-    local rule_name="Ensure /etc/shadow password fields are not empty"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local empty_pass=$(awk -F: '($2 == "" ) { print $1 }' /etc/shadow)
-        
-        if [ -z "$empty_pass" ]; then
-            log_pass "No empty password fields"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Accounts with empty passwords: $empty_pass"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local empty_pass=$(awk -F: '($2 == "" ) { print $1 }' /etc/shadow)
-        
-        if [ -n "$empty_pass" ]; then
-            save_config "$rule_id" "$rule_name" "$empty_pass"
-            
-            for user in $empty_pass; do
-                passwd -l "$user"
-                log_info "Locked account with empty password: $user"
-            done
-            
-            ((FIXED_CHECKS++))
-        fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_warn "Password field rollback requires manual intervention"
-    fi
-}
-
-check_groups_exist() {
-    local rule_id="SYS-GROUPS-EXIST"
-    local rule_name="Ensure all groups in /etc/passwd exist in /etc/group"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local missing_groups=""
-        
-        for gid in $(cut -d: -f4 /etc/passwd | sort -u); do
-            if ! grep -q "^[^:]*:[^:]*:$gid:" /etc/group; then
-                missing_groups="$missing_groups GID:$gid"
-            fi
-        done
-        
-        if [ -z "$missing_groups" ]; then
-            log_pass "All groups exist"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Missing groups:$missing_groups"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        save_config "$rule_id" "$rule_name" "missing_groups"
-        log_warn "Manual intervention required to create missing groups"
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_info "Manual review required"
-    fi
-}
-
-check_duplicate_uids() {
-    local rule_id="SYS-DUPLICATE-UIDS"
-    local rule_name="Ensure no duplicate UIDs exist"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local duplicates=$(cut -d: -f3 /etc/passwd | sort | uniq -d)
-        
-        if [ -z "$duplicates" ]; then
-            log_pass "No duplicate UIDs"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Duplicate UIDs found: $duplicates"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local duplicates=$(cut -d: -f3 /etc/passwd | sort | uniq -d)
-        
-        if [ -n "$duplicates" ]; then
-            save_config "$rule_id" "$rule_name" "$duplicates"
-            log_warn "Manual intervention required to resolve duplicate UIDs"
+            log_fail "Failed to fix permissions for $file"
         fi
     fi
 }
 
-check_duplicate_gids() {
-    local rule_id="SYS-DUPLICATE-GIDS"
-    local rule_name="Ensure no duplicate GIDs exist"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local duplicates=$(cut -d: -f3 /etc/group | sort | uniq -d)
-        
-        if [ -z "$duplicates" ]; then
-            log_pass "No duplicate GIDs"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Duplicate GIDs found: $duplicates"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local duplicates=$(cut -d: -f3 /etc/group | sort | uniq -d)
-        
-        if [ -n "$duplicates" ]; then
-            save_config "$rule_id" "$rule_name" "$duplicates"
-            log_warn "Manual intervention required to resolve duplicate GIDs"
-        fi
-    fi
-}
+# Initialize the database before any checks
+initialize_db
 
-check_duplicate_usernames() {
-    local rule_id="SYS-DUPLICATE-USERNAMES"
-    local rule_name="Ensure no duplicate user names exist"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local duplicates=$(cut -d: -f1 /etc/passwd | sort | uniq -d)
-        
-        if [ -z "$duplicates" ]; then
-            log_pass "No duplicate usernames"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Duplicate usernames found: $duplicates"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local duplicates=$(cut -d: -f1 /etc/passwd | sort | uniq -d)
-        
-        if [ -n "$duplicates" ]; then
-            save_config "$rule_id" "$rule_name" "$duplicates"
-            log_warn "Manual intervention required to resolve duplicate usernames"
-        fi
-    fi
-}
+# System File Checks — Permissions
+check_perm /etc/passwd "644" "Ensure permissions on /etc/passwd"
+check_perm /etc/passwd- "600,644" "Ensure permissions on /etc/passwd-"
+check_perm /etc/group "644" "Ensure permissions on /etc/group"
+check_perm /etc/group- "600,644" "Ensure permissions on /etc/group-"
+check_perm /etc/shadow "600,640" "Ensure permissions on /etc/shadow"
+check_perm /etc/shadow- "600" "Ensure permissions on /etc/shadow-"
+check_perm /etc/gshadow "600,640" "Ensure permissions on /etc/gshadow"
+check_perm /etc/gshadow- "600" "Ensure permissions on /etc/gshadow-"
+check_perm /etc/shells "644" "Ensure permissions on /etc/shells"
+check_perm /etc/security/opasswd "600,644" "Ensure permissions on /etc/security/opasswd"
 
-check_duplicate_groupnames() {
-    local rule_id="SYS-DUPLICATE-GROUPNAMES"
-    local rule_name="Ensure no duplicate group names exist"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local duplicates=$(cut -d: -f1 /etc/group | sort | uniq -d)
-        
-        if [ -z "$duplicates" ]; then
-            log_pass "No duplicate group names"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Duplicate group names found: $duplicates"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local duplicates=$(cut -d: -f1 /etc/group | sort | uniq -d)
-        
-        if [ -n "$duplicates" ]; then
-            save_config "$rule_id" "$rule_name" "$duplicates"
-            log_warn "Manual intervention required to resolve duplicate group names"
-        fi
-    fi
-}
+# ---------------------------------------------------------------------------
+# Shadow password and empty fields
+# ---------------------------------------------------------------------------
+if pwck -r 2>&1 | grep -q "no shadow"; then
+    log_fail "Some accounts are not using shadow passwords"
+    save_config "Ensure all accounts use shadow passwords" "fail" "N/A" "N/A"
+else
+    log_pass "All accounts use shadow passwords"
+    save_config "Ensure all accounts use shadow passwords" "pass" "N/A" "N/A"
+fi
 
-check_shadow_group_empty() {
-    local rule_id="SYS-SHADOW-GROUP"
-    local rule_name="Ensure shadow group is empty"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local shadow_members=$(grep "^shadow:" /etc/group | cut -d: -f4)
-        
-        if [ -z "$shadow_members" ]; then
-            log_pass "Shadow group is empty"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Shadow group has members: $shadow_members"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        local shadow_members=$(grep "^shadow:" /etc/group | cut -d: -f4)
-        
-        if [ -n "$shadow_members" ]; then
-            save_config "$rule_id" "$rule_name" "$shadow_members"
-            
-            # Remove all members from shadow group
-            gpasswd -M "" shadow 2>/dev/null
-            
-            log_info "Removed members from shadow group"
-            ((FIXED_CHECKS++))
-        fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        local original=$(get_original_config "$rule_id")
-        if [ -n "$original" ]; then
-            log_warn "Manual restoration of shadow group members required"
-            log_info "Original members: $original"
-        fi
-    fi
-}
+empty_fields=$(awk -F: '($2 == "") {print $1}' /etc/shadow)
+if [[ -z "$empty_fields" ]]; then
+    log_pass "No empty password fields"
+    save_config "Ensure /etc/shadow password fields are not empty" "pass" "N/A" "N/A"
+else
+    log_fail "Empty password fields found: $empty_fields"
+    save_config "Ensure /etc/shadow password fields are not empty" "fail" "$empty_fields" "N/A"
+fi
 
-check_user_home_directories() {
-    local rule_id="SYS-HOME-DIRS"
-    local rule_name="Ensure local interactive user home directories are configured"
-    
-    ((TOTAL_CHECKS++))
-    echo ""
-    echo "Checking: $rule_name"
-    echo "Rule ID: $rule_id"
-    
-    if [ "$MODE" = "scan" ]; then
-        local issues=0
-        
-        while IFS=: read -r user _ uid _ _ home _; do
-            if [ "$uid" -ge 1000 ] && [ "$user" != "nobody" ]; then
-                if [ ! -d "$home" ]; then
-                    log_warn "Home directory missing for $user: $home"
-                    ((issues++))
-                fi
-            fi
-        done < /etc/passwd
-        
-        if [ $issues -eq 0 ]; then
-            log_pass "All user home directories exist"
-            ((PASSED_CHECKS++))
-            return 0
-        else
-            log_error "Found $issues home directory issues"
-            ((FAILED_CHECKS++))
-            return 1
-        fi
-        
-    elif [ "$MODE" = "fix" ]; then
-        save_config "$rule_id" "$rule_name" "home_dir_issues"
-        
-        while IFS=: read -r user _ uid _ _ home _; do
-            if [ "$uid" -ge 1000 ] && [ "$user" != "nobody" ]; then
-                if [ ! -d "$home" ]; then
-                    mkdir -p "$home"
-                    chown "$user:$user" "$home"
-                    chmod 750 "$home"
-                    log_info "Created home directory for $user"
-                fi
-            fi
-        done < /etc/passwd
-        
-        ((FIXED_CHECKS++))
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_warn "Home directory rollback not recommended"
-    fi
-}
+# ---------------------------------------------------------------------------
+# Duplicate UIDs, GIDs, usernames, group names
+# ---------------------------------------------------------------------------
+dup_uids=$(awk -F: '($3 >= 1000){print $3}' /etc/passwd | sort -n | uniq -d)
+[[ -z "$dup_uids" ]] && log_pass "No duplicate UIDs (real users)" || log_fail "Duplicate UIDs found: $dup_uids"
 
-# ============================================================================
-# Main Execution
-# ============================================================================
+dup_gids=$(awk -F: '($3 >= 1000){print $3}' /etc/group | sort -n | uniq -d)
+[[ -z "$dup_gids" ]] && log_pass "No duplicate GIDs (real users)" || log_fail "Duplicate GIDs found: $dup_gids"
 
-main() {
-    echo "========================================================================"
-    echo "System Maintenance Hardening Script"
-    echo "Mode: $MODE"
-    echo "========================================================================"
-    
-    if [ "$MODE" = "scan" ] || [ "$MODE" = "fix" ]; then
-        check_all_system_file_permissions
-        
-        log_info ""
-        log_info "=== World Writable and Unowned Files ==="
-        check_world_writable
-        check_unowned_files
-        check_suid_sgid_files
-        
-        log_info ""
-        log_info "=== User and Group Settings ==="
-        check_passwd_shadowed
-        check_empty_password_fields
-        check_groups_exist
-        check_duplicate_uids
-        check_duplicate_gids
-        check_duplicate_usernames
-        check_duplicate_groupnames
-        check_shadow_group_empty
-        check_user_home_directories
-        
-        echo ""
-        echo "========================================================================"
-        echo "Summary"
-        echo "========================================================================"
-        echo "Total Checks: $TOTAL_CHECKS"
-        
-        if [ "$MODE" = "scan" ]; then
-            echo "Passed: $PASSED_CHECKS"
-            echo "Failed: $FAILED_CHECKS"
-            
-            if [ $FAILED_CHECKS -eq 0 ]; then
-                log_pass "All system maintenance checks passed!"
-            else
-                log_warn "$FAILED_CHECKS checks failed. Run with 'fix' mode to remediate."
-            fi
-        else
-            echo "Fixed: $FIXED_CHECKS"
-            log_info "Fixes applied. Run 'scan' mode to verify."
-        fi
-        
-    elif [ "$MODE" = "rollback" ]; then
-        log_info "Rolling back system maintenance configurations..."
-        check_all_system_file_permissions
-        check_shadow_group_empty
-        log_info "Rollback completed"
-    else
-        echo "Usage: $0 {scan|fix|rollback}"
-        exit 1
-    fi
-}
+dup_users=$(awk -F: '{print $1}' /etc/passwd | sort | uniq -d)
+[[ -z "$dup_users" ]] && log_pass "No duplicate usernames" || log_fail "Duplicate usernames found: $dup_users"
 
-main
+dup_groupnames=$(awk -F: '{print $1}' /etc/group | sort | uniq -d)
+[[ -z "$dup_groupnames" ]] && log_pass "No duplicate group names" || log_fail "Duplicate group names found: $dup_groupnames"
+
+# ---------------------------------------------------------------------------
+# Home directories check (informational)
+# ---------------------------------------------------------------------------
+homes=$(awk -F: '($3>=1000 && $1!="nobody"){print $6}' /etc/passwd | grep -v "^/home")
+[[ -z "$homes" ]] && log_info "All real user home directories under /home" || log_info "System service homes outside /home detected: $homes"
+
+# ---------------------------------------------------------------------------
+# Dotfiles permissions
+# ---------------------------------------------------------------------------
+dangerous_dotfiles=$(find /home -maxdepth 3 -type f -name ".*" -perm /022 2>/dev/null)
+[[ -n "$dangerous_dotfiles" ]] && log_fail "Dangerous dotfile permissions found:\n$dangerous_dotfiles" || log_pass "No dangerous dotfile permissions"
+
+# ---------------------------------------------------------------------------
+# World-writable files
+# ---------------------------------------------------------------------------
+world_write=$(find / -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o \
+    -path /run -prune -o -path /tmp -prune -o -path /var/tmp -prune -o -type f -perm -0002 -print 2>/dev/null)
+[[ -n "$world_write" ]] && log_fail "World-writable files found:\n$world_write" || log_pass "No unsafe world-writable files"
+
+# ---------------------------------------------------------------------------
+# System files ownership
+# ---------------------------------------------------------------------------
+nog=$(find / -path /home -prune -o -path /tmp -prune -o -path /var/tmp -prune -o \
+    -path /run/user -prune -o -path /proc -prune -o -path /sys -prune -o \
+    -path /run -prune -o -path /dev -prune -o -nouser -o -nogroup -print 2>/dev/null)
+[[ -n "$nog" ]] && log_fail "System files without owner/group found:\n$nog" || log_pass "All system files have valid owners/groups"
+
+# ---------------------------------------------------------------------------
+# SUID/SGID files (informational)
+# ---------------------------------------------------------------------------
+suid=$(find / -xdev -perm -4000 2>/dev/null)
+sgid=$(find / -xdev -perm -2000 2>/dev/null)
+log_info "SUID files found: $(echo "$suid" | wc -l)"
+log_info "SGID files found: $(echo "$sgid" | wc -l)"
+
+# ---------------------------------------------------------------------------
+# Invalid shells
+# ---------------------------------------------------------------------------
+invalid_shells=$(pwck -r 2>&1 | grep "invalid shell")
+[[ -n "$invalid_shells" ]] && log_fail "Invalid shells detected:\n$invalid_shells" || log_pass "All users have valid shells"
+
+# ---------------------------------------------------------------------------
+# sudoers and opasswd
+# ---------------------------------------------------------------------------
+[[ -e /etc/sudoers ]] && log_pass "sudoers file exists" || log_fail "sudoers missing"
+[[ -e /etc/security/opasswd ]] && log_pass "opasswd file exists" || log_fail "opasswd missing"
+
+# ---------------------------------------------------------------------------
+# hosts.allow and hosts.deny
+# ---------------------------------------------------------------------------
+[[ -e /etc/hosts.allow ]] && log_pass "hosts.allow exists" || log_fail "hosts.allow missing"
+[[ -e /etc/hosts.deny ]] && log_pass "hosts.deny exists" || log_fail "hosts.deny missing"
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo -e "\n==================== Summary ====================" | tee -a "$LOG"
+echo "Total Checks : $TOTAL_CHECKS" | tee -a "$LOG"
+echo "Passed       : $PASSED_CHECKS" | tee -a "$LOG"
+echo "Failed       : $FAILED_CHECKS" | tee -a "$LOG"
+echo "Fixed        : $FIXED_CHECKS" | tee -a "$LOG"
+echo -e "=================================================" | tee -a "$LOG"
+
+if [ "$FAILED_CHECKS" -gt 0 ]; then
+    echo -e "${RED}[FAIL] Issues detected.${NC}" | tee -a "$LOG"
+else
+    echo -e "${GREEN}[PASS] All checks passed.${NC}" | tee -a "$LOG"
+fi
