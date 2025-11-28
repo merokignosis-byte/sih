@@ -55,12 +55,26 @@ save_config() {
     local original_value="$3"
     local current_value="${4:-$original_value}"
     
+    # Run the Python command
     python3 -c "
 import sqlite3
 import sys
 try:
     conn = sqlite3.connect('$DB_PATH')
     cursor = conn.cursor()
+    # Ensure the table is created if it somehow doesn't exist yet
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS configurations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT NOT NULL,
+            rule_id TEXT NOT NULL UNIQUE,
+            rule_name TEXT NOT NULL,
+            original_value TEXT,
+            current_value TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'original'
+        );
+    ''')
     cursor.execute('''
         INSERT OR REPLACE INTO configurations 
         (topic, rule_id, rule_name, original_value, current_value, status)
@@ -68,10 +82,16 @@ try:
     ''', ('$TOPIC', '$rule_id', '''$rule_name''', '''$original_value''', '''$current_value'''))
     conn.commit()
     conn.close()
-except Exception as e:
-    print(f'Database error: {e}', file=sys.stderr)
+except sqlite3.Error as e:
+    # Print the specific error to stderr
+    print(f'Database error in shell script: {e}', file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null || log_warn "Could not save to database"
+"
+    
+    # Check the exit status of the python command explicitly
+    if [ $? -ne 0 ]; then
+        log_warn "Could not save configuration to database for $rule_id. Check stderr output for details."
+    fi
 }
 
 get_original_config() {
